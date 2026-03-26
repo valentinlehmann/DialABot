@@ -48,7 +48,7 @@ LABEL maintainer="Adam Dodman <hello@dodman.co.uk>" \
 
 
 RUN apt-get update -qy \
- && apt-get install -qy --no-install-recommends pulseaudio libasound2 xvfb x11vnc xauth dbus tini \
+ && apt-get install -qy --no-install-recommends pulseaudio libasound2 xvfb x11vnc xauth dbus tini inetutils-telnet expect \
         # Teamspeak required libraries
         libnss3 libxcomposite1 libxcursor1 libpci3 libxslt1.1 libegl1 libxkbcommon0 libevent-2.1-7 libatomic1 \
         libxcb-xinerama0 libxcb-xinput0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xkb1 libxkbcommon-x11-0 \

@@ -8,8 +8,16 @@ dbus-daemon --system --print-address --fork
 
 pulseaudio --exit-idle-time=-1 --disallow-exit=yes --system --daemonize --disallow-module-loading -n --file=/etc/pulse/system.pa
 
-pjsua --realm="*" --auto-answer 200 --log-level 3 --no-cli-console --use-cli --config-file /config/pjsua.cfg &
+# Start Xvfb for TeamSpeak
+touch /root/.Xauthority
+Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp -auth /root/.Xauthority &
 
-# This probably could be inlined and shrunk, but lets be honest this isn't exactly a lightweight solution already.
-# I also don't like this HOME hack, but Teamspeak doesn't give us much option.
-HOME=/config/ts3client xvfb-run -f /root/.Xauthority /opt/teamspeak/ts3client_runscript.sh --no-sandbox
+export PJSUA_LOG_FILE=/tmp/pjsua.log
+rm -f "$PJSUA_LOG_FILE"
+
+# Start pjsua exactly as in the working config
+pjsua --realm="*" --auto-answer 200 --no-cli-console --use-cli --config-file /config/pjsua.cfg \
+    --log-level 5 --app-log-level 3 --log-file "$PJSUA_LOG_FILE" --log-append &
+
+# Monitor for active calls and connect/disconnect the always-running TeamSpeak client accordingly
+exec /usr/bin/call-monitor

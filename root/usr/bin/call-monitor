@@ -1,0 +1,312 @@
+#!/bin/sh
+# Monitors for active SIP calls by checking UDP socket count.
+# Keeps TeamSpeak running continuously and toggles server presence via ClientQuery.
+
+TS_PID=""
+TS_CONNECTED=0
+TS_QUERY_HOST="127.0.0.1"
+TS_QUERY_PORT="25639"
+CONFIG_FILE="${DIALABOT_CONFIG:-/config/dialabot.cfg}"
+PJSUA_LOG_FILE="${PJSUA_LOG_FILE:-/tmp/pjsua.log}"
+LOG_CURSOR=0
+CURRENT_CALLER_ID=""
+DTMF_BUFFER=""
+POLL_INTERVAL="${CALL_MONITOR_INTERVAL:-0.2}"
+
+load_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "[call-monitor] Missing config file: $CONFIG_FILE"
+        exit 1
+    fi
+
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+
+    if [ -z "${TS3_SERVER_ADDRESS:-}" ] || [ -z "${TS3_CLIENT_API_KEY:-}" ]; then
+        echo "[call-monitor] Missing TS3_SERVER_ADDRESS or TS3_CLIENT_API_KEY in $CONFIG_FILE"
+        exit 1
+    fi
+}
+
+start_teamspeak() {
+    if [ -n "$TS_PID" ] && kill -0 "$TS_PID" 2>/dev/null; then
+        return
+    fi
+
+    echo "[call-monitor] Starting TeamSpeak client..."
+    HOME=/config/ts3client /opt/teamspeak/ts3client_runscript.sh --no-sandbox &
+    TS_PID=$!
+    TS_CONNECTED=0
+}
+
+ts3_escape_value() {
+    printf "%s" "$1" | sed \
+        -e 's/\\/\\\\/g' \
+        -e 's/ /\\s/g' \
+        -e 's/|/\\p/g' \
+        -e 's/\//\\\//g'
+}
+
+read_log_cursor() {
+    if [ -f "$PJSUA_LOG_FILE" ]; then
+        wc -l <"$PJSUA_LOG_FILE" | tr -d ' '
+        return 0
+    fi
+
+    echo 0
+    return 0
+}
+
+capture_new_log_lines() {
+    OUTPUT_FILE="$1"
+
+    : >"$OUTPUT_FILE"
+
+    if [ ! -f "$PJSUA_LOG_FILE" ]; then
+        return 0
+    fi
+
+    START_LINE=$((LOG_CURSOR + 1))
+    if [ "$START_LINE" -lt 1 ]; then
+        START_LINE=1
+    fi
+
+    sed -n "${START_LINE},\$p" "$PJSUA_LOG_FILE" >"$OUTPUT_FILE"
+    LOG_CURSOR=$(read_log_cursor)
+}
+
+extract_caller_id() {
+    if [ ! -f "$PJSUA_LOG_FILE" ]; then
+        return 1
+    fi
+
+    START_LINE=$((LOG_CURSOR + 1))
+    if [ "$START_LINE" -lt 1 ]; then
+        START_LINE=1
+    fi
+
+    CALLER_ID=$(
+        sed -n "${START_LINE},\$p" "$PJSUA_LOG_FILE" | sed -n \
+            -e 's/.*Incoming call from .*sip:\([^@;> ]*\).*/\1/p' \
+            -e 's/.*Incoming call from .*tel:\([^;> ]*\).*/\1/p' \
+            -e 's/.*From: .*<sip:\([^@;> ]*\).*/\1/p' \
+            -e 's/.*From: .*<tel:\([^;> ]*\).*/\1/p' \
+            -e 's/.*From: sip:\([^@;> ]*\).*/\1/p' \
+            -e 's/.*From: tel:\([^;> ]*\).*/\1/p' \
+            | tail -n 1
+    )
+
+    if [ -n "$CALLER_ID" ]; then
+        printf "%s\n" "$CALLER_ID"
+        return 0
+    fi
+
+    return 1
+}
+
+wait_for_query() {
+    ATTEMPT=0
+
+    while [ "$ATTEMPT" -lt 30 ]; do
+        if /usr/bin/ts3-query "$TS_QUERY_HOST" "$TS_QUERY_PORT" "$TS3_CLIENT_API_KEY" "help" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        ATTEMPT=$((ATTEMPT + 1))
+        sleep 1
+    done
+
+    echo "[call-monitor] ClientQuery not reachable on $TS_QUERY_HOST:$TS_QUERY_PORT"
+    return 1
+}
+
+run_query_command() {
+    QUERY_COMMAND="$1"
+    QUERY_LOG=$(mktemp)
+
+    if ! wait_for_query; then
+        rm -f "$QUERY_LOG"
+        return 1
+    fi
+
+    if run_query_capture "$QUERY_COMMAND" "$QUERY_LOG"; then
+        sed 's/^/[call-monitor] query> /' "$QUERY_LOG"
+        rm -f "$QUERY_LOG"
+        return 0
+    fi
+
+    echo "[call-monitor] ClientQuery command failed: $QUERY_COMMAND"
+    sed 's/^/[call-monitor] query> /' "$QUERY_LOG" >&2
+    rm -f "$QUERY_LOG"
+    return 1
+}
+
+run_query_capture() {
+    QUERY_COMMAND="$1"
+    QUERY_LOG="$2"
+
+    /usr/bin/ts3-query "$TS_QUERY_HOST" "$TS_QUERY_PORT" "$TS3_CLIENT_API_KEY" "$QUERY_COMMAND" \
+        >"$QUERY_LOG" 2>&1
+}
+
+get_own_client_id() {
+    QUERY_LOG=$(mktemp)
+
+    if ! wait_for_query; then
+        rm -f "$QUERY_LOG"
+        return 1
+    fi
+
+    if ! run_query_capture "whoami" "$QUERY_LOG"; then
+        echo "[call-monitor] Failed to resolve own TeamSpeak client ID"
+        sed 's/^/[call-monitor] query> /' "$QUERY_LOG" >&2
+        rm -f "$QUERY_LOG"
+        return 1
+    fi
+
+    sed 's/^/[call-monitor] query> /' "$QUERY_LOG" >&2
+
+    CLID=$(grep -o 'clid=[0-9][0-9]*' "$QUERY_LOG" | head -n 1 | cut -d= -f2)
+    rm -f "$QUERY_LOG"
+
+    if [ -n "$CLID" ]; then
+        printf "%s\n" "$CLID"
+        return 0
+    fi
+
+    echo "[call-monitor] TeamSpeak whoami did not return clid"
+    return 1
+}
+
+switch_teamspeak_channel() {
+    TARGET_CID="$1"
+
+    if [ -z "$TARGET_CID" ]; then
+        return 0
+    fi
+
+    if ! OWN_CLID=$(get_own_client_id); then
+        return 1
+    fi
+
+    echo "[call-monitor] Switching TeamSpeak to channel $TARGET_CID using clid $OWN_CLID"
+    run_query_command "clientmove cid=$TARGET_CID clid=$OWN_CLID"
+}
+
+handle_dtmf_digit() {
+    DIGIT="$1"
+
+    case "$DIGIT" in
+        [0-9])
+            DTMF_BUFFER="${DTMF_BUFFER}${DIGIT}"
+            echo "[call-monitor] Buffered DTMF digits: $DTMF_BUFFER"
+            ;;
+        '#')
+            if [ -z "$DTMF_BUFFER" ]; then
+                echo "[call-monitor] Ignoring DTMF # with empty buffer"
+                return 0
+            fi
+
+            TARGET_CID="$DTMF_BUFFER"
+            DTMF_BUFFER=""
+            switch_teamspeak_channel "$TARGET_CID" || true
+            ;;
+        *)
+            echo "[call-monitor] Ignoring unsupported DTMF digit: $DIGIT"
+            ;;
+    esac
+}
+
+process_call_events() {
+    NEW_LOG_FILE=$(mktemp)
+
+    capture_new_log_lines "$NEW_LOG_FILE"
+    if [ ! -s "$NEW_LOG_FILE" ]; then
+        rm -f "$NEW_LOG_FILE"
+        return 0
+    fi
+
+    while IFS= read -r LOG_LINE; do
+        DIGIT=$(printf "%s\n" "$LOG_LINE" | sed -n \
+            -e 's/.*Incoming DTMF on call .*:[[:space:]]*\([0-9#*]\).*/\1/p' \
+            | head -n 1)
+
+        if [ -n "$DIGIT" ]; then
+            handle_dtmf_digit "$DIGIT"
+        fi
+    done <"$NEW_LOG_FILE"
+
+    rm -f "$NEW_LOG_FILE"
+}
+
+connect_teamspeak() {
+    CONNECT_COMMAND="connect address=$TS3_SERVER_ADDRESS"
+
+    CURRENT_CALLER_ID=""
+    if CALLER_ID=$(extract_caller_id); then
+        CURRENT_CALLER_ID="$CALLER_ID"
+        ESCAPED_CALLER_ID=$(ts3_escape_value "$CALLER_ID")
+        CONNECT_COMMAND="$CONNECT_COMMAND nickname=$ESCAPED_CALLER_ID"
+        echo "[call-monitor] Call active, connecting TeamSpeak to $TS3_SERVER_ADDRESS with nickname $CALLER_ID"
+    else
+        echo "[call-monitor] Call active, connecting TeamSpeak to $TS3_SERVER_ADDRESS (caller ID unavailable)"
+    fi
+
+    if run_query_command "$CONNECT_COMMAND"; then
+        TS_CONNECTED=1
+        DTMF_BUFFER=""
+        LOG_CURSOR=$(read_log_cursor)
+        return 0
+    fi
+
+    return 1
+}
+
+disconnect_teamspeak() {
+    echo "[call-monitor] Call ended, disconnecting TeamSpeak"
+    if run_query_command "disconnect"; then
+        TS_CONNECTED=0
+        CURRENT_CALLER_ID=""
+        DTMF_BUFFER=""
+        return 0
+    fi
+
+    return 1
+}
+
+load_config
+start_teamspeak
+
+# Wait for pjsua to initialize
+sleep 5
+
+# Record baseline UDP socket count (no active calls)
+BASELINE=$(cat /proc/net/udp 2>/dev/null | wc -l)
+LOG_CURSOR=$(read_log_cursor)
+echo "[call-monitor] Baseline UDP sockets: $BASELINE"
+
+while true; do
+    start_teamspeak
+
+    CURRENT=$(cat /proc/net/udp 2>/dev/null | wc -l)
+
+    # During a call pjsua opens RTP+RTCP sockets (typically +2-3 above baseline)
+    if [ "$CURRENT" -gt "$((BASELINE + 1))" ]; then
+        if [ "$TS_CONNECTED" -eq 0 ]; then
+            echo "[call-monitor] New UDP sockets detected ($CURRENT vs baseline $BASELINE)"
+            connect_teamspeak || true
+        else
+            process_call_events
+        fi
+    else
+        if [ "$TS_CONNECTED" -eq 1 ]; then
+            echo "[call-monitor] UDP sockets back to baseline"
+            disconnect_teamspeak || true
+            LOG_CURSOR=$(read_log_cursor)
+        else
+            LOG_CURSOR=$(read_log_cursor)
+        fi
+    fi
+
+    sleep "$POLL_INTERVAL"
+done

@@ -1,0 +1,80 @@
+#!/usr/bin/expect -f
+
+set timeout 15
+
+if {$argc != 4} {
+    puts stderr "usage: ts3-query <host> <port> <apikey> <command>"
+    exit 2
+}
+
+set host [lindex $argv 0]
+set port [lindex $argv 1]
+set apikey [lindex $argv 2]
+set command [lindex $argv 3]
+
+log_user 0
+
+proc fail {message} {
+    puts stderr $message
+    exit 1
+}
+
+proc read_response {label} {
+    while {1} {
+        expect {
+            -re {([^\r\n]+)\r?\n} {
+                set line [string trim $expect_out(1,string)]
+
+                if {$line eq ""} {
+                    exp_continue
+                }
+
+                puts "$label> $line"
+
+                if {[regexp {^error id=([0-9]+) msg=(.*)$} $line -> err msg]} {
+                    if {$err ne "0"} {
+                        fail "$label failed: error id=$err msg=$msg"
+                    }
+                    return
+                }
+
+                exp_continue
+            }
+            timeout {
+                fail "$label failed: timed out waiting for response"
+            }
+            eof {
+                fail "$label failed: query connection closed unexpectedly"
+            }
+        }
+    }
+}
+
+spawn telnet $host $port
+
+expect {
+    -re {selected schandlerid=[0-9]+} {
+        puts "greeting> [string trim $expect_out(0,string)]"
+    }
+    timeout {
+        fail "greeting failed: timed out waiting for ClientQuery greeting"
+    }
+    eof {
+        fail "greeting failed: could not connect to ClientQuery"
+    }
+}
+
+send -- "auth apikey=$apikey\r"
+read_response "auth"
+
+send -- "use\r"
+read_response "use"
+
+send -- "$command\r"
+read_response "command"
+
+send -- "quit\r"
+expect {
+    eof {}
+    timeout {}
+}
