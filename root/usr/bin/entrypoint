@@ -2,10 +2,11 @@
 set -e
 
 mkdir -p /run/dbus /config/ts3client
+rm -f /run/dbus/pid /run/pulse/pid /var/run/pulse/.config/pulse/cookie /tmp/.X99-lock /tmp/.X11-unix/X99
 
 dbus-daemon --system --print-address --fork
 
-pulseaudio --exit-idle-time=-1 --disallow-exit=yes --system --daemonize --disallow-module-loading
+pulseaudio --exit-idle-time=-1 --disallow-exit=yes --system --daemonize --disallow-module-loading -n --file=/etc/pulse/system.pa
 
 pjsua --realm="*" --auto-answer 200 --log-level 3 --no-cli-console --use-cli --config-file /config/pjsua.cfg &
 

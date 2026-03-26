@@ -1,14 +1,15 @@
-ARG PJSUA_VER=2.11
-ARG TS3_VER=3.5.6
-FROM spritsail/debian-builder:buster-slim as builder
+ARG PJSUA_VER=2.16
+ARG TS3_VER=3.6.2
+FROM debian:bookworm-slim AS builder
 
 ARG MAKEFLAGS
 ARG PJSUA_VER
 ARG TS3_VER
 
 # Set up output structure, install needed headers
-RUN mkdir -p /output/usr/bin/ /output/opt/ \
- && apt-get install -y --no-install-recommends libasound2-dev
+RUN apt-get update \
+ && mkdir -p /output/usr/bin/ /output/opt/ \
+ && apt-get install -y --no-install-recommends build-essential curl file ca-certificates libasound2-dev
 
 # Build pjsua & copy the binary we need
 WORKDIR /tmp/pjsua
@@ -16,7 +17,7 @@ WORKDIR /tmp/pjsua
 RUN curl -sSL https://github.com/pjsip/pjproject/archive/refs/tags/$PJSUA_VER.tar.gz | tar xz --strip-components=1 \
  && ./configure \
  && make dep && make \
- && cp pjsip-apps/bin/pjsua-x86_64-unknown-linux-gnu /output/usr/bin/pjsua
+ && cp pjsip-apps/bin/pjsua-* /output/usr/bin/pjsua
 
 # Download & Extract the Teamspeak Client
 WORKDIR /tmp/teamspeak
@@ -31,7 +32,7 @@ RUN find /output -exec sh -c 'file "{}" | grep -q ELF && strip --strip-debug "{}
 
 #=========================
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 ARG PJSUA_VER
 ARG TS3_VER
@@ -49,7 +50,8 @@ LABEL maintainer="Adam Dodman <hello@dodman.co.uk>" \
 RUN apt-get update -qy \
  && apt-get install -qy --no-install-recommends pulseaudio libasound2 xvfb x11vnc xauth dbus tini \
         # Teamspeak required libraries
-        libnss3 libxcomposite1 libxcursor1 libpci3 libxslt1.1 libegl1 libxkbcommon0 \
+        libnss3 libxcomposite1 libxcursor1 libpci3 libxslt1.1 libegl1 libxkbcommon0 libevent-2.1-7 libatomic1 \
+        libxcb-xinerama0 libxcb-xinput0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xkb1 libxkbcommon-x11-0 \
  && apt-get clean
 
 COPY --from=builder /output/ /
